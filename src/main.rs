@@ -21,6 +21,9 @@ struct ScannedPage {
     image: String,
     width: u32,
     height: u32,
+    dpi: u32,
+    width_mm: f64,
+    height_mm: f64,
     page: u32,
 }
 
@@ -227,11 +230,17 @@ async fn scan_endpoint(body: Option<Json<ScanRequest>>) -> (StatusCode, Json<Sca
             let images: Vec<ScannedPage> = pages
                 .into_iter()
                 .enumerate()
-                .map(|(i, (png_data, width, height))| ScannedPage {
-                    image: STANDARD.encode(&png_data),
-                    width,
-                    height,
-                    page: (i + 1) as u32,
+                .map(|(i, (png_data, width, height))| {
+                    let dpi = 300u32;
+                    ScannedPage {
+                        image: STANDARD.encode(&png_data),
+                        width,
+                        height,
+                        dpi,
+                        width_mm: (width as f64 / dpi as f64) * 25.4,
+                        height_mm: (height as f64 / dpi as f64) * 25.4,
+                        page: (i + 1) as u32,
+                    }
                 })
                 .collect();
 

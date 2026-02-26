@@ -1,5 +1,7 @@
 v2: Çalışan bir versiyon. Rest API dinleyip, image bilgisi dönüyor.
 v3: Çift taraflı tarama (duplex) desteği eklendi.
+v4:
+    tarama profili ekleyelim.
 
 
 
