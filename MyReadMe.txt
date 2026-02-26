@@ -1,10 +1,21 @@
+v2: Çalışan bir versiyon. Rest API dinleyip, image bilgisi dönüyor.
+v3: Çift taraflı tarama (duplex) desteği eklendi.
+
+
+
+
 PowerShell'de curl farklı çalışıyor. Şu komutu kullanın:
 
+  Tek taraflı tarama:
   Invoke-WebRequest -Uri http://localhost:3000/scan -Method POST
+
+  Çift taraflı (duplex) tarama:
+  Invoke-WebRequest -Uri http://localhost:3000/scan -Method POST -ContentType "application/json" -Body '{"duplex": true}'
 
   Veya kısa versiyonu:
 
   irm http://localhost:3000/scan -Method POST
+  irm http://localhost:3000/scan -Method POST -ContentType "application/json" -Body '{"duplex": true}'
 
   Sadece sağlık kontrolü için (GET):
 
@@ -21,3 +32,5 @@ PowerShell'de curl farklı çalışıyor. Şu komutu kullanın:
 
     Derleyip hemen çalıştırmak isterseniz:
     cargo run --release
+
+
