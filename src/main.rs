@@ -5,6 +5,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+use image::DynamicImage;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::process::Command;
@@ -14,6 +15,58 @@ use tower_http::cors::{Any, CorsLayer};
 struct ScanRequest {
     #[serde(default)]
     duplex: bool,
+    #[serde(default = "default_profile")]
+    profile: String,
+    #[serde(default = "default_true")]
+    auto_crop: bool,
+}
+
+fn default_profile() -> String {
+    "renkli".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+struct ScanProfile {
+    color_mode: u32, // WIA 6146: 1=Renkli, 2=Gri, 4=S/B
+    dpi: u32,
+    name: String,
+}
+
+fn get_profile(profile: &str) -> Result<ScanProfile> {
+    match profile {
+        "hizli" => Ok(ScanProfile {
+            color_mode: 2,
+            dpi: 150,
+            name: "Hızlı Tarama".to_string(),
+        }),
+        "standart" => Ok(ScanProfile {
+            color_mode: 2,
+            dpi: 300,
+            name: "Standart Belge".to_string(),
+        }),
+        "renkli" => Ok(ScanProfile {
+            color_mode: 1,
+            dpi: 300,
+            name: "Renkli Belge".to_string(),
+        }),
+        "yuksek" => Ok(ScanProfile {
+            color_mode: 1,
+            dpi: 600,
+            name: "Yüksek Kalite".to_string(),
+        }),
+        "siyah-beyaz" => Ok(ScanProfile {
+            color_mode: 4,
+            dpi: 300,
+            name: "Siyah-Beyaz".to_string(),
+        }),
+        _ => anyhow::bail!(
+            "Geçersiz profil: '{}'. Geçerli profiller: hizli, standart, renkli, yuksek, siyah-beyaz",
+            profile
+        ),
+    }
 }
 
 #[derive(Serialize)]
@@ -33,6 +86,8 @@ struct ScanResponse {
     images: Option<Vec<ScannedPage>>,
     format: Option<String>,
     duplex: bool,
+    profile: Option<String>,
+    auto_crop: bool,
     page_count: Option<u32>,
     error: Option<String>,
 }
@@ -43,9 +98,82 @@ struct HealthResponse {
     scanner: String,
 }
 
-fn scan_document(duplex: bool) -> Result<Vec<(Vec<u8>, u32, u32)>> {
+/// Beyaz kenarları tespit edip görüntüyü kırpar (auto-crop).
+/// Eşik değeri (threshold) ile beyaza yakın pikseller de beyaz sayılır.
+fn auto_crop(img: &DynamicImage) -> DynamicImage {
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let threshold: u8 = 245; // Bu değerin üstündeki R,G,B beyaz sayılır
+
+    // Üstten: ilk beyaz olmayan satırı bul
+    let mut top = 0u32;
+    'top: for y in 0..h {
+        for x in 0..w {
+            let p = rgba.get_pixel(x, y);
+            if p[0] < threshold || p[1] < threshold || p[2] < threshold {
+                top = y;
+                break 'top;
+            }
+        }
+    }
+
+    // Alttan: son beyaz olmayan satırı bul
+    let mut bottom = h.saturating_sub(1);
+    'bottom: for y in (0..h).rev() {
+        for x in 0..w {
+            let p = rgba.get_pixel(x, y);
+            if p[0] < threshold || p[1] < threshold || p[2] < threshold {
+                bottom = y;
+                break 'bottom;
+            }
+        }
+    }
+
+    // Soldan: ilk beyaz olmayan sütunu bul
+    let mut left = 0u32;
+    'left: for x in 0..w {
+        for y in top..=bottom {
+            let p = rgba.get_pixel(x, y);
+            if p[0] < threshold || p[1] < threshold || p[2] < threshold {
+                left = x;
+                break 'left;
+            }
+        }
+    }
+
+    // Sağdan: son beyaz olmayan sütunu bul
+    let mut right = w.saturating_sub(1);
+    'right: for x in (0..w).rev() {
+        for y in top..=bottom {
+            let p = rgba.get_pixel(x, y);
+            if p[0] < threshold || p[1] < threshold || p[2] < threshold {
+                right = x;
+                break 'right;
+            }
+        }
+    }
+
+    // Güvenlik: en az 1x1 piksel olsun
+    if right <= left || bottom <= top {
+        return img.clone();
+    }
+
+    let crop_w = right - left + 1;
+    let crop_h = bottom - top + 1;
+
+    println!(
+        "Auto-crop: {}x{} -> {}x{} (sol:{}, üst:{}, sağ:{}, alt:{})",
+        w, h, crop_w, crop_h, left, top, right, bottom
+    );
+
+    img.crop_imm(left, top, crop_w, crop_h)
+}
+
+fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool) -> Result<Vec<(Vec<u8>, u32, u32)>> {
     let temp_dir = std::env::temp_dir();
     let temp_dir_str = temp_dir.to_string_lossy();
+    let color_mode = profile.color_mode;
+    let dpi = profile.dpi;
 
     let duplex_setup = if duplex {
         r#"
@@ -102,10 +230,10 @@ fn scan_document(duplex: bool) -> Result<Vec<(Vec<u8>, u32, u32)>> {
 
         $item = $scanner.Items[1]
 
-        # Tarama ayarları (300 DPI, renkli)
-        $item.Properties("6146").Value = 1   # Renkli
-        $item.Properties("6147").Value = 300  # Yatay DPI
-        $item.Properties("6148").Value = 300  # Dikey DPI
+        # Tarama ayarları (profil: {profile_name})
+        $item.Properties("6146").Value = {color_mode}  # Renk modu
+        $item.Properties("6147").Value = {dpi}  # Yatay DPI
+        $item.Properties("6148").Value = {dpi}  # Dikey DPI
 
         $pageCount = 0
         $tempBase = "{temp_dir_str}"
@@ -140,6 +268,9 @@ fn scan_document(duplex: bool) -> Result<Vec<(Vec<u8>, u32, u32)>> {
         duplex_setup = duplex_setup,
         duplex_back_scan = duplex_back_scan,
         temp_dir_str = temp_dir_str,
+        color_mode = color_mode,
+        dpi = dpi,
+        profile_name = profile.name,
     );
 
     let output = Command::new("powershell")
@@ -172,7 +303,7 @@ fn scan_document(duplex: bool) -> Result<Vec<(Vec<u8>, u32, u32)>> {
         let png_path = temp_dir.join(format!("scan_page_{}.png", i));
 
         // PNG varsa onu, yoksa BMP'yi kullan
-        let (img_path, is_png) = if png_path.exists() {
+        let (img_path, _is_png) = if png_path.exists() {
             (png_path.clone(), true)
         } else if bmp_path.exists() {
             (bmp_path.clone(), false)
@@ -184,17 +315,21 @@ fn scan_document(duplex: bool) -> Result<Vec<(Vec<u8>, u32, u32)>> {
 
         let img = image::open(&img_path)
             .context(format!("Sayfa {} görüntüsü açılamadı: {}", i, img_path.display()))?;
+
+        // Auto-crop isteniyorsa beyaz kenarları kırp
+        let img = if do_auto_crop {
+            auto_crop(&img)
+        } else {
+            img
+        };
         let width = img.width();
         let height = img.height();
 
-        let png_data = if is_png {
-            std::fs::read(&img_path).context(format!("Sayfa {} PNG dosyası okunamadı", i))?
-        } else {
-            let mut cursor = Cursor::new(Vec::new());
-            img.write_to(&mut cursor, image::ImageFormat::Png)
-                .context(format!("Sayfa {} PNG dönüşümü başarısız", i))?;
-            cursor.into_inner()
-        };
+        // Kırpılmış görüntüyü PNG olarak encode et
+        let mut cursor = Cursor::new(Vec::new());
+        img.write_to(&mut cursor, image::ImageFormat::Png)
+            .context(format!("Sayfa {} PNG dönüşümü başarısız", i))?;
+        let png_data = cursor.into_inner();
 
         pages.push((png_data, width, height));
 
@@ -218,29 +353,54 @@ async fn health_check() -> Json<HealthResponse> {
 }
 
 async fn scan_endpoint(body: Option<Json<ScanRequest>>) -> (StatusCode, Json<ScanResponse>) {
-    let duplex = body.map(|Json(r)| r.duplex).unwrap_or(false);
+    let (duplex, profile_key, do_auto_crop) = match body {
+        Some(Json(r)) => (r.duplex, r.profile, r.auto_crop),
+        None => (false, default_profile(), true),
+    };
+
+    let profile = match get_profile(&profile_key) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ScanResponse {
+                    success: false,
+                    images: None,
+                    format: None,
+                    duplex,
+                    profile: Some(profile_key),
+                    auto_crop: do_auto_crop,
+                    page_count: None,
+                    error: Some(e.to_string()),
+                }),
+            );
+        }
+    };
+
     println!(
-        "Tarama isteği alındı (duplex: {})...",
-        if duplex { "çift taraflı" } else { "tek taraflı" }
+        "Tarama isteği alındı (profil: {}, duplex: {}, auto_crop: {})...",
+        profile.name,
+        if duplex { "çift taraflı" } else { "tek taraflı" },
+        do_auto_crop
     );
 
-    match scan_document(duplex) {
+    let dpi = profile.dpi;
+    let profile_name = profile.name.clone();
+
+    match scan_document(duplex, &profile, do_auto_crop) {
         Ok(pages) => {
             let page_count = pages.len() as u32;
             let images: Vec<ScannedPage> = pages
                 .into_iter()
                 .enumerate()
-                .map(|(i, (png_data, width, height))| {
-                    let dpi = 300u32;
-                    ScannedPage {
-                        image: STANDARD.encode(&png_data),
-                        width,
-                        height,
-                        dpi,
-                        width_mm: (width as f64 / dpi as f64) * 25.4,
-                        height_mm: (height as f64 / dpi as f64) * 25.4,
-                        page: (i + 1) as u32,
-                    }
+                .map(|(i, (png_data, width, height))| ScannedPage {
+                    image: STANDARD.encode(&png_data),
+                    width,
+                    height,
+                    dpi,
+                    width_mm: (width as f64 / dpi as f64) * 25.4,
+                    height_mm: (height as f64 / dpi as f64) * 25.4,
+                    page: (i + 1) as u32,
                 })
                 .collect();
 
@@ -253,6 +413,8 @@ async fn scan_endpoint(body: Option<Json<ScanRequest>>) -> (StatusCode, Json<Sca
                     images: Some(images),
                     format: Some("png".to_string()),
                     duplex,
+                    profile: Some(profile_name),
+                    auto_crop: do_auto_crop,
                     page_count: Some(page_count),
                     error: None,
                 }),
@@ -268,6 +430,8 @@ async fn scan_endpoint(body: Option<Json<ScanRequest>>) -> (StatusCode, Json<Sca
                     images: None,
                     format: None,
                     duplex,
+                    profile: Some(profile_name),
+                    auto_crop: do_auto_crop,
                     page_count: None,
                     error: Some(e.to_string()),
                 }),
@@ -300,7 +464,8 @@ async fn main() {
     println!("  GET  /        - Sağlık kontrolü");
     println!("  GET  /health  - Sağlık kontrolü");
     println!("  POST /scan    - Tarama başlat");
-    println!("                  Body: {{\"duplex\": true/false}}");
+    println!("                  Body: {{\"duplex\": bool, \"profile\": string, \"auto_crop\": bool}}");
+    println!("\nProfiller: hizli, standart, renkli (varsayılan), yuksek, siyah-beyaz");
     println!();
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
