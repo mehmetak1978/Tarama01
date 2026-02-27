@@ -37,4 +37,13 @@ PowerShell'de curl farklı çalışıyor. Şu komutu kullanın:
     Derleyip hemen çalıştırmak isterseniz:
     cargo run --release
 
+  Ayrıca asıl sorunu da netleştireyim: Bu Fujitsu fi-8150U'nun WIA driver'ı çoklu sayfa taramayı desteklemiyor. İkinci Transfer() çağrısı her zaman asılı kalıyor. Fiziksel olarak 2 sayfa geçiyor ama WIA sadece 1 tanesini
+  döndürüyor.
+
+  Bunun için iki alternatif var:
+
+  1. NAPS2 CLI — ücretsiz, Fujitsu ADF'yi mükemmel destekliyor, komut satırından tarama yapılabiliyor
+  2. Windows.Devices.Scanners (UWP API) — modern Windows tarama API'si, feeder'ı doğal destekliyor
+
+  NAPS2 kurulu mu bilgisayarında? Yoksa kurmak ister misin? En güvenilir çözüm bu olur.
 

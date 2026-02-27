@@ -8,7 +8,8 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use image::DynamicImage;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Deserialize)]
@@ -19,6 +20,8 @@ struct ScanRequest {
     profile: String,
     #[serde(default = "default_true")]
     auto_crop: bool,
+    /// Taranacak sayfa sayısı (belirtilmezse otomatik algılama)
+    pages: Option<u32>,
 }
 
 fn default_profile() -> String {
@@ -169,194 +172,198 @@ fn auto_crop(img: &DynamicImage) -> DynamicImage {
     img.crop_imm(left, top, crop_w, crop_h)
 }
 
-fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool) -> Result<Vec<(Vec<u8>, u32, u32)>> {
-    let temp_dir = std::env::temp_dir();
-    let temp_dir_str = temp_dir.to_string_lossy();
-    let color_mode = profile.color_mode;
-    let dpi = profile.dpi;
+/// Tek bir sayfa tarar. Başarılıysa BMP dosya yolunu döndürür.
+/// Besleyici boşsa veya hata varsa None döndürür.
+fn scan_single_page(
+    page_num: u32,
+    profile: &ScanProfile,
+    duplex: bool,
+    temp_dir: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>> {
+    let bmp_path = temp_dir.join(format!("scan_page_{}.bmp", page_num));
+    let bmp_path_str = bmp_path.to_string_lossy();
 
-    let duplex_setup = if duplex {
-        r#"
-        # Çift taraflı tarama ayarı
-        try {
-            # Document Handling Select: FEEDER(1) + DUPLEX(4) = 5
-            $scanner.Properties("3088").Value = 5
-        } catch {
-            throw "Çift taraflı tarama ayarı yapılamadı: $_"
-        }
-        "#
-    } else {
-        ""
-    };
+    let duplex_prop = if duplex { "5" } else { "1" };
 
     let ps_script = format!(
         r#"
         $ErrorActionPreference = 'Stop'
-        Add-Type -AssemblyName System.Runtime.InteropServices
         $deviceManager = New-Object -ComObject WIA.DeviceManager
-
-        # Fujitsu fi-8150U tarayıcısını bul
-        $allScanners = $deviceManager.DeviceInfos | Where-Object {{ $_.Type -eq 1 }}
-        $device = $allScanners | Where-Object {{
+        $device = $deviceManager.DeviceInfos | Where-Object {{ $_.Type -eq 1 }} | Where-Object {{
             $_.Properties('Name').Value -like '*Fujitsu*' -or
             $_.Properties('Name').Value -like '*fi-8150*'
         }} | Select-Object -First 1
 
-        if (-not $device) {{
-            throw "Fujitsu fi-8150U tarayıcısı bulunamadı!"
-        }}
+        if (-not $device) {{ throw "Tarayıcı bulunamadı!" }}
 
-        # Tarayıcı meşgulse yeniden dene (3 deneme)
+        # Bağlan (3 deneme)
         $scanner = $null
         for ($attempt = 1; $attempt -le 3; $attempt++) {{
             try {{
                 $scanner = $device.Connect()
                 break
             }} catch {{
-                if ($attempt -eq 3) {{ throw "Tarayıcı meşgul, 3 deneme başarısız: $_" }}
-                Write-Host "Tarayıcı meşgul, $attempt. deneme başarısız. 2 saniye bekleniyor..."
+                if ($attempt -eq 3) {{ throw "Tarayıcı meşgul: $_" }}
                 Start-Sleep -Seconds 2
             }}
         }}
 
-        {duplex_setup}
+        # Besleyici ayarı
+        try {{ $scanner.Properties("3088").Value = {duplex_prop} }} catch {{}}
+        # Tek sayfa tara
+        $scanner.Properties("3096").Value = 1
 
         $item = $scanner.Items[1]
+        $item.Properties("6146").Value = {color_mode}
+        $item.Properties("6147").Value = {dpi}
+        $item.Properties("6148").Value = {dpi}
 
-        # Tarama ayarları (profil: {profile_name})
-        $item.Properties("6146").Value = {color_mode}  # Renk modu
-        $item.Properties("6147").Value = {dpi}  # Yatay DPI
-        $item.Properties("6148").Value = {dpi}  # Dikey DPI
+        $img = $item.Transfer()
+        $bmpFile = "{bmp_path_str}"
+        if (Test-Path $bmpFile) {{ Remove-Item $bmpFile -Force }}
+        $img.SaveFile($bmpFile)
 
-        $pageCount = 0
-        $tempBase = "{temp_dir_str}"
-        $hasMorePages = $true
+        # COM nesnelerini temizle
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($img) | Out-Null
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($item) | Out-Null
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($scanner) | Out-Null
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($deviceManager) | Out-Null
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
 
-        # Besleyicide kağıt kalmayana kadar tara
-        while ($hasMorePages) {{
-            # Besleyicide kağıt var mı kontrol et (Property 3087, Bit 0 = FEED_READY)
-            if ($pageCount -gt 0) {{
-                try {{
-                    $feedStatus = $scanner.Properties("3087").Value
-                    if (-not ($feedStatus -band 1)) {{
-                        $hasMorePages = $false
-                        continue
-                    }}
-                }} catch {{
-                    $hasMorePages = $false
-                    continue
-                }}
-            }}
-
-            try {{
-                $img = $item.Transfer()
-                $pageCount++
-                $bmpFile = "$tempBase\scan_page_$pageCount.bmp"
-                if (Test-Path $bmpFile) {{ Remove-Item $bmpFile -Force }}
-                $img.SaveFile($bmpFile)
-            }} catch {{
-                # Besleyici boş veya başka hata - taramayı durdur
-                if ($pageCount -eq 0) {{
-                    throw "Tarama hatası: $_"
-                }}
-                $hasMorePages = $false
-            }}
-        }}
-
-        # PNG'ye dönüştür
-        Add-Type -AssemblyName System.Drawing
-        for ($i = 1; $i -le $pageCount; $i++) {{
-            $bmp = "$tempBase\scan_page_$i.bmp"
-            $png = "$tempBase\scan_page_$i.png"
-            if (Test-Path $png) {{ Remove-Item $png -Force }}
-
-            try {{
-                $bitmap = [System.Drawing.Image]::FromFile($bmp)
-                $bitmap.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
-                $bitmap.Dispose()
-            }} catch {{
-                # PNG dönüşümü başarısız olursa BMP ile devam
-            }}
-        }}
-
-        Write-Output "PAGES:$pageCount"
+        Write-Output "OK"
     "#,
-        duplex_setup = duplex_setup,
-        temp_dir_str = temp_dir_str,
-        color_mode = color_mode,
-        dpi = dpi,
-        profile_name = profile.name,
+        duplex_prop = duplex_prop,
+        color_mode = profile.color_mode,
+        dpi = profile.dpi,
+        bmp_path_str = bmp_path_str,
     );
 
-    let output = Command::new("powershell")
+    let mut child = Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_script])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("PowerShell çalıştırılamadı")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Tarama hatası: {}", stderr);
+    // stdout/stderr thread'leri
+    let stdout_pipe = child.stdout.take().unwrap();
+    let stderr_pipe = child.stderr.take().unwrap();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::BufReader::new(stdout_pipe), &mut buf).ok();
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::BufReader::new(stderr_pipe), &mut buf).ok();
+        buf
+    });
+
+    // 60 saniye timeout
+    let timeout = Duration::from_secs(60);
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait().context("PowerShell durumu kontrol edilemedi")? {
+            Some(status) => break status,
+            None => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // Timeout = besleyici boş olabilir
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    };
+
+    let stdout_bytes = stdout_handle.join().unwrap_or_default();
+    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        let stderr_str = stderr.to_string();
+        // Besleyici boş veya kağıt yok hatalarını "bitti" olarak say
+        if stderr_str.contains("paper")
+            || stderr_str.contains("empty")
+            || stderr_str.contains("no document")
+            || stderr_str.contains("FEED")
+        {
+            return Ok(None);
+        }
+        // İlk sayfa değilse hata yerine None dön
+        if page_num > 1 {
+            println!("Sayfa {} hatası (tarama durduruluyor): {}", page_num, stderr_str.trim());
+            return Ok(None);
+        }
+        anyhow::bail!("Tarama hatası: {}", stderr_str);
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    println!("PowerShell çıktısı: {}", stdout);
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    if stdout.trim() == "OK" && bmp_path.exists() {
+        Ok(Some(bmp_path))
+    } else {
+        Ok(None)
+    }
+}
 
-    // Sayfa sayısını bul
-    let page_count: u32 = stdout
-        .lines()
-        .find(|l| l.starts_with("PAGES:"))
-        .and_then(|l| l.strip_prefix("PAGES:"))
-        .and_then(|n| n.trim().parse().ok())
-        .unwrap_or(1);
-
-    println!("Taranan sayfa sayısı: {}", page_count);
-
+fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool, expected_pages: Option<u32>) -> Result<Vec<(Vec<u8>, u32, u32)>> {
+    let temp_dir = std::env::temp_dir();
+    let max_pages = expected_pages.unwrap_or(100);
     let mut pages = Vec::new();
 
-    for i in 1..=page_count {
-        let bmp_path = temp_dir.join(format!("scan_page_{}.bmp", i));
-        let png_path = temp_dir.join(format!("scan_page_{}.png", i));
+    for i in 1..=max_pages {
+        println!("Sayfa {} taranıyor...", i);
 
-        // PNG varsa onu, yoksa BMP'yi kullan
-        let (img_path, _is_png) = if png_path.exists() {
-            (png_path.clone(), true)
-        } else if bmp_path.exists() {
-            (bmp_path.clone(), false)
-        } else {
-            anyhow::bail!("Sayfa {} dosyası bulunamadı!", i);
-        };
+        match scan_single_page(i, profile, duplex, &temp_dir) {
+            Ok(Some(bmp_path)) => {
+                println!("Sayfa {} başarılı: {}", i, bmp_path.display());
 
-        println!("Sayfa {} okunuyor: {}", i, img_path.display());
+                let img = image::open(&bmp_path)
+                    .context(format!("Sayfa {} açılamadı", i))?;
 
-        let img = image::open(&img_path)
-            .context(format!("Sayfa {} görüntüsü açılamadı: {}", i, img_path.display()))?;
+                let img = if do_auto_crop {
+                    auto_crop(&img)
+                } else {
+                    img
+                };
 
-        // Auto-crop isteniyorsa beyaz kenarları kırp
-        let img = if do_auto_crop {
-            auto_crop(&img)
-        } else {
-            img
-        };
-        let width = img.width();
-        let height = img.height();
+                let width = img.width();
+                let height = img.height();
 
-        // Kırpılmış görüntüyü PNG olarak encode et
-        let mut cursor = Cursor::new(Vec::new());
-        img.write_to(&mut cursor, image::ImageFormat::Png)
-            .context(format!("Sayfa {} PNG dönüşümü başarısız", i))?;
-        let png_data = cursor.into_inner();
+                let mut cursor = Cursor::new(Vec::new());
+                img.write_to(&mut cursor, image::ImageFormat::Png)
+                    .context(format!("Sayfa {} PNG dönüşümü başarısız", i))?;
 
-        pages.push((png_data, width, height));
+                pages.push((cursor.into_inner(), width, height));
+                let _ = std::fs::remove_file(&bmp_path);
 
-        // Geçici dosyaları sil
-        let _ = std::fs::remove_file(&bmp_path);
-        let _ = std::fs::remove_file(&png_path);
+                // Sonraki sayfa için tarayıcının serbest kalmasını bekle
+                if i < max_pages {
+                    println!("Tarayıcı serbest bırakılıyor (2 saniye)...");
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
+            Ok(None) => {
+                println!("Sayfa {} yok veya besleyici boş, tarama tamamlandı.", i);
+                break;
+            }
+            Err(e) => {
+                if pages.is_empty() {
+                    return Err(e);
+                }
+                println!("Sayfa {} hatası: {}, mevcut sayfalarla devam ediliyor.", i, e);
+                break;
+            }
+        }
     }
 
     if pages.is_empty() {
         anyhow::bail!("Hiç sayfa taranamadı!");
     }
 
+    println!("Toplam {} sayfa tarandı.", pages.len());
     Ok(pages)
 }
 
@@ -368,9 +375,9 @@ async fn health_check() -> Json<HealthResponse> {
 }
 
 async fn scan_endpoint(body: Option<Json<ScanRequest>>) -> (StatusCode, Json<ScanResponse>) {
-    let (duplex, profile_key, do_auto_crop) = match body {
-        Some(Json(r)) => (r.duplex, r.profile, r.auto_crop),
-        None => (false, default_profile(), true),
+    let (duplex, profile_key, do_auto_crop, expected_pages) = match body {
+        Some(Json(r)) => (r.duplex, r.profile, r.auto_crop, r.pages),
+        None => (false, default_profile(), true, None),
     };
 
     let profile = match get_profile(&profile_key) {
@@ -393,16 +400,17 @@ async fn scan_endpoint(body: Option<Json<ScanRequest>>) -> (StatusCode, Json<Sca
     };
 
     println!(
-        "Tarama isteği alındı (profil: {}, duplex: {}, auto_crop: {})...",
+        "Tarama isteği alındı (profil: {}, duplex: {}, auto_crop: {}, pages: {})...",
         profile.name,
         if duplex { "çift taraflı" } else { "tek taraflı" },
-        do_auto_crop
+        do_auto_crop,
+        expected_pages.map_or("otomatik".to_string(), |p| p.to_string())
     );
 
     let dpi = profile.dpi;
     let profile_name = profile.name.clone();
 
-    match scan_document(duplex, &profile, do_auto_crop) {
+    match scan_document(duplex, &profile, do_auto_crop, expected_pages) {
         Ok(pages) => {
             let page_count = pages.len() as u32;
             let images: Vec<ScannedPage> = pages
@@ -479,7 +487,7 @@ async fn main() {
     println!("  GET  /        - Sağlık kontrolü");
     println!("  GET  /health  - Sağlık kontrolü");
     println!("  POST /scan    - Tarama başlat");
-    println!("                  Body: {{\"duplex\": bool, \"profile\": string, \"auto_crop\": bool}}");
+    println!("                  Body: {{\"duplex\": bool, \"profile\": string, \"auto_crop\": bool, \"pages\": number}}");
     println!("\nProfiller: hizli, standart, renkli (varsayılan), yuksek, siyah-beyaz");
     println!();
 
