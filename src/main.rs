@@ -172,18 +172,44 @@ fn auto_crop(img: &DynamicImage) -> DynamicImage {
     img.crop_imm(left, top, crop_w, crop_h)
 }
 
-/// Tek bir sayfa tarar. Başarılıysa BMP dosya yolunu döndürür.
-/// Besleyici boşsa veya hata varsa None döndürür.
-fn scan_single_page(
-    page_num: u32,
+/// Tek bir fiziksel yaprağı tarar.
+/// Simplex: 1 BMP döndürür. Duplex: 2 BMP döndürür (ön + arka).
+/// Besleyici boşsa boş Vec döndürür.
+fn scan_single_sheet(
+    sheet_num: u32,
+    image_start_num: u32,
     profile: &ScanProfile,
     duplex: bool,
     temp_dir: &std::path::Path,
-) -> Result<Option<std::path::PathBuf>> {
-    let bmp_path = temp_dir.join(format!("scan_page_{}.bmp", page_num));
-    let bmp_path_str = bmp_path.to_string_lossy();
+) -> Result<Vec<std::path::PathBuf>> {
+    let front_path = temp_dir.join(format!("scan_page_{}.bmp", image_start_num));
+    let back_path = temp_dir.join(format!("scan_page_{}.bmp", image_start_num + 1));
+    let front_path_str = front_path.to_string_lossy();
+    let back_path_str = back_path.to_string_lossy();
 
     let duplex_prop = if duplex { "5" } else { "1" };
+
+    let duplex_back_script = if duplex {
+        format!(
+            r#"
+        # Arka yüz (duplex)
+        try {{
+            $img2 = $item.Transfer()
+            $backFile = "{back_path_str}"
+            if (Test-Path $backFile) {{ Remove-Item $backFile -Force }}
+            $img2.SaveFile($backFile)
+            [System.Runtime.Interopservices.Marshal]::ReleaseComObject($img2) | Out-Null
+            Write-Host "Arka yuz kaydedildi"
+            $pageCount++
+        }} catch {{
+            Write-Host "Arka yuz alinamadi: $_"
+        }}
+            "#,
+            back_path_str = back_path_str,
+        )
+    } else {
+        String::new()
+    };
 
     let ps_script = format!(
         r#"
@@ -210,7 +236,7 @@ fn scan_single_page(
 
         # Besleyici ayarı
         try {{ $scanner.Properties("3088").Value = {duplex_prop} }} catch {{}}
-        # Tek sayfa tara
+        # Tek yaprak tara
         $scanner.Properties("3096").Value = 1
 
         $item = $scanner.Items[1]
@@ -218,25 +244,33 @@ fn scan_single_page(
         $item.Properties("6147").Value = {dpi}
         $item.Properties("6148").Value = {dpi}
 
+        $pageCount = 0
+
+        # Ön yüz
         $img = $item.Transfer()
-        $bmpFile = "{bmp_path_str}"
-        if (Test-Path $bmpFile) {{ Remove-Item $bmpFile -Force }}
-        $img.SaveFile($bmpFile)
+        $frontFile = "{front_path_str}"
+        if (Test-Path $frontFile) {{ Remove-Item $frontFile -Force }}
+        $img.SaveFile($frontFile)
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($img) | Out-Null
+        Write-Host "On yuz kaydedildi"
+        $pageCount++
+
+        {duplex_back_script}
 
         # COM nesnelerini temizle
-        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($img) | Out-Null
         [System.Runtime.Interopservices.Marshal]::ReleaseComObject($item) | Out-Null
         [System.Runtime.Interopservices.Marshal]::ReleaseComObject($scanner) | Out-Null
         [System.Runtime.Interopservices.Marshal]::ReleaseComObject($deviceManager) | Out-Null
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
 
-        Write-Output "OK"
+        Write-Output "PAGES:$pageCount"
     "#,
         duplex_prop = duplex_prop,
         color_mode = profile.color_mode,
         dpi = profile.dpi,
-        bmp_path_str = bmp_path_str,
+        front_path_str = front_path_str,
+        duplex_back_script = duplex_back_script,
     );
 
     let mut child = Command::new("powershell")
@@ -271,7 +305,7 @@ fn scan_single_page(
                     let _ = child.kill();
                     let _ = child.wait();
                     // Timeout = besleyici boş olabilir
-                    return Ok(None);
+                    return Ok(Vec::new());
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
@@ -290,81 +324,100 @@ fn scan_single_page(
             || stderr_str.contains("no document")
             || stderr_str.contains("FEED")
         {
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        // İlk sayfa değilse hata yerine None dön
-        if page_num > 1 {
-            println!("Sayfa {} hatası (tarama durduruluyor): {}", page_num, stderr_str.trim());
-            return Ok(None);
+        // İlk yaprak değilse hata yerine boş dön
+        if sheet_num > 1 {
+            println!("Yaprak {} hatası (tarama durduruluyor): {}", sheet_num, stderr_str.trim());
+            return Ok(Vec::new());
         }
         anyhow::bail!("Tarama hatası: {}", stderr_str);
     }
 
     let stdout = String::from_utf8_lossy(&stdout_bytes);
-    if stdout.trim() == "OK" && bmp_path.exists() {
-        Ok(Some(bmp_path))
-    } else {
-        Ok(None)
+    let stdout_str = stdout.trim();
+
+    // Kaç sayfa kaydedildi?
+    let saved_count: u32 = stdout_str
+        .lines()
+        .find(|l| l.starts_with("PAGES:"))
+        .and_then(|l| l.strip_prefix("PAGES:"))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0);
+
+    let mut results = Vec::new();
+    if saved_count >= 1 && front_path.exists() {
+        results.push(front_path);
     }
+    if saved_count >= 2 && back_path.exists() {
+        results.push(back_path);
+    }
+
+    Ok(results)
 }
 
 fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool, expected_pages: Option<u32>) -> Result<Vec<(Vec<u8>, u32, u32)>> {
     let temp_dir = std::env::temp_dir();
-    let max_pages = expected_pages.unwrap_or(100);
-    let mut pages = Vec::new();
+    // pages = fiziksel yaprak sayısı
+    let max_sheets = expected_pages.unwrap_or(100);
+    let mut all_images = Vec::new();
+    let mut image_counter = 1u32;
 
-    for i in 1..=max_pages {
-        println!("Sayfa {} taranıyor...", i);
+    for sheet in 1..=max_sheets {
+        println!("Yaprak {} taranıyor{}...", sheet, if duplex { " (çift taraflı)" } else { "" });
 
-        match scan_single_page(i, profile, duplex, &temp_dir) {
-            Ok(Some(bmp_path)) => {
-                println!("Sayfa {} başarılı: {}", i, bmp_path.display());
+        match scan_single_sheet(sheet, image_counter, profile, duplex, &temp_dir) {
+            Ok(bmp_paths) if bmp_paths.is_empty() => {
+                println!("Yaprak {} yok veya besleyici boş, tarama tamamlandı.", sheet);
+                break;
+            }
+            Ok(bmp_paths) => {
+                for bmp_path in &bmp_paths {
+                    println!("Görüntü {} başarılı: {}", image_counter, bmp_path.display());
 
-                let img = image::open(&bmp_path)
-                    .context(format!("Sayfa {} açılamadı", i))?;
+                    let img = image::open(bmp_path)
+                        .context(format!("Görüntü {} açılamadı", image_counter))?;
 
-                let img = if do_auto_crop {
-                    auto_crop(&img)
-                } else {
-                    img
-                };
+                    let img = if do_auto_crop {
+                        auto_crop(&img)
+                    } else {
+                        img
+                    };
 
-                let width = img.width();
-                let height = img.height();
+                    let width = img.width();
+                    let height = img.height();
 
-                let mut cursor = Cursor::new(Vec::new());
-                img.write_to(&mut cursor, image::ImageFormat::Png)
-                    .context(format!("Sayfa {} PNG dönüşümü başarısız", i))?;
+                    let mut cursor = Cursor::new(Vec::new());
+                    img.write_to(&mut cursor, image::ImageFormat::Png)
+                        .context(format!("Görüntü {} PNG dönüşümü başarısız", image_counter))?;
 
-                pages.push((cursor.into_inner(), width, height));
-                let _ = std::fs::remove_file(&bmp_path);
+                    all_images.push((cursor.into_inner(), width, height));
+                    let _ = std::fs::remove_file(bmp_path);
+                    image_counter += 1;
+                }
 
-                // Sonraki sayfa için tarayıcının serbest kalmasını bekle
-                if i < max_pages {
+                // Sonraki yaprak için tarayıcının serbest kalmasını bekle
+                if sheet < max_sheets {
                     println!("Tarayıcı serbest bırakılıyor (2 saniye)...");
                     std::thread::sleep(Duration::from_secs(2));
                 }
             }
-            Ok(None) => {
-                println!("Sayfa {} yok veya besleyici boş, tarama tamamlandı.", i);
-                break;
-            }
             Err(e) => {
-                if pages.is_empty() {
+                if all_images.is_empty() {
                     return Err(e);
                 }
-                println!("Sayfa {} hatası: {}, mevcut sayfalarla devam ediliyor.", i, e);
+                println!("Yaprak {} hatası: {}, mevcut görüntülerle devam ediliyor.", sheet, e);
                 break;
             }
         }
     }
 
-    if pages.is_empty() {
+    if all_images.is_empty() {
         anyhow::bail!("Hiç sayfa taranamadı!");
     }
 
-    println!("Toplam {} sayfa tarandı.", pages.len());
-    Ok(pages)
+    println!("Toplam {} görüntü tarandı ({} yaprak).", all_images.len(), (all_images.len() + 1) / 2);
+    Ok(all_images)
 }
 
 async fn health_check() -> Json<HealthResponse> {
