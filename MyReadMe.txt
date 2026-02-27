@@ -4,6 +4,8 @@ v4:
     tarama profili ve crop özelliği eklendi.
 v5:
     birden fazla sayfayı arka arkaya tarama
+v6: Dosya boyu. jpeg'e çevrildi. Kalite değişkeni eklendi.
+
 
 
 

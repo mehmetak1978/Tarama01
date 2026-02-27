@@ -22,6 +22,13 @@ struct ScanRequest {
     auto_crop: bool,
     /// Taranacak sayfa sayısı (belirtilmezse otomatik algılama)
     pages: Option<u32>,
+    /// JPEG kalite (1-100, varsayılan 85)
+    #[serde(default = "default_quality")]
+    quality: u8,
+}
+
+fn default_quality() -> u8 {
+    85
 }
 
 fn default_profile() -> String {
@@ -356,7 +363,7 @@ fn scan_single_sheet(
     Ok(results)
 }
 
-fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool, expected_pages: Option<u32>) -> Result<Vec<(Vec<u8>, u32, u32)>> {
+fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool, expected_pages: Option<u32>, quality: u8) -> Result<Vec<(Vec<u8>, u32, u32)>> {
     let temp_dir = std::env::temp_dir();
     // pages = fiziksel yaprak sayısı
     let max_sheets = expected_pages.unwrap_or(100);
@@ -388,8 +395,12 @@ fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool, expect
                     let height = img.height();
 
                     let mut cursor = Cursor::new(Vec::new());
-                    img.write_to(&mut cursor, image::ImageFormat::Png)
-                        .context(format!("Görüntü {} PNG dönüşümü başarısız", image_counter))?;
+                    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                        &mut cursor,
+                        quality.clamp(1, 100),
+                    );
+                    img.write_with_encoder(encoder)
+                        .context(format!("Görüntü {} JPEG dönüşümü başarısız", image_counter))?;
 
                     all_images.push((cursor.into_inner(), width, height));
                     let _ = std::fs::remove_file(bmp_path);
@@ -428,9 +439,9 @@ async fn health_check() -> Json<HealthResponse> {
 }
 
 async fn scan_endpoint(body: Option<Json<ScanRequest>>) -> (StatusCode, Json<ScanResponse>) {
-    let (duplex, profile_key, do_auto_crop, expected_pages) = match body {
-        Some(Json(r)) => (r.duplex, r.profile, r.auto_crop, r.pages),
-        None => (false, default_profile(), true, None),
+    let (duplex, profile_key, do_auto_crop, expected_pages, quality) = match body {
+        Some(Json(r)) => (r.duplex, r.profile, r.auto_crop, r.pages, r.quality),
+        None => (false, default_profile(), true, None, default_quality()),
     };
 
     let profile = match get_profile(&profile_key) {
@@ -453,17 +464,18 @@ async fn scan_endpoint(body: Option<Json<ScanRequest>>) -> (StatusCode, Json<Sca
     };
 
     println!(
-        "Tarama isteği alındı (profil: {}, duplex: {}, auto_crop: {}, pages: {})...",
+        "Tarama isteği alındı (profil: {}, duplex: {}, auto_crop: {}, pages: {}, quality: {})...",
         profile.name,
         if duplex { "çift taraflı" } else { "tek taraflı" },
         do_auto_crop,
-        expected_pages.map_or("otomatik".to_string(), |p| p.to_string())
+        expected_pages.map_or("otomatik".to_string(), |p| p.to_string()),
+        quality
     );
 
     let dpi = profile.dpi;
     let profile_name = profile.name.clone();
 
-    match scan_document(duplex, &profile, do_auto_crop, expected_pages) {
+    match scan_document(duplex, &profile, do_auto_crop, expected_pages, quality) {
         Ok(pages) => {
             let page_count = pages.len() as u32;
             let images: Vec<ScannedPage> = pages
@@ -487,7 +499,7 @@ async fn scan_endpoint(body: Option<Json<ScanRequest>>) -> (StatusCode, Json<Sca
                 Json(ScanResponse {
                     success: true,
                     images: Some(images),
-                    format: Some("png".to_string()),
+                    format: Some("jpeg".to_string()),
                     duplex,
                     profile: Some(profile_name),
                     auto_crop: do_auto_crop,
@@ -540,7 +552,7 @@ async fn main() {
     println!("  GET  /        - Sağlık kontrolü");
     println!("  GET  /health  - Sağlık kontrolü");
     println!("  POST /scan    - Tarama başlat");
-    println!("                  Body: {{\"duplex\": bool, \"profile\": string, \"auto_crop\": bool, \"pages\": number}}");
+    println!("                  Body: {{\"duplex\": bool, \"profile\": string, \"auto_crop\": bool, \"pages\": number, \"quality\": 1-100}}");
     println!("\nProfiller: hizli, standart, renkli (varsayılan), yuksek, siyah-beyaz");
     println!();
 
