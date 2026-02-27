@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(cargo build:*)",
-      "Bash(powershell -Command \"\\(Get-Item ''C:\\\\Users\\\\70886\\\\RustroverProjects\\\\Tarama01\\\\target\\\\release\\\\Tarama01.exe''\\).Length / 1MB\")"
+      "Bash(powershell -Command \"\\(Get-Item ''C:\\\\Users\\\\70886\\\\RustroverProjects\\\\Tarama01\\\\target\\\\release\\\\Tarama01.exe''\\).Length / 1MB\")",
+      "Bash(cargo check:*)"
     ]
   }
 }

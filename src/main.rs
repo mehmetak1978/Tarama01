@@ -189,24 +189,6 @@ fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool) -> Res
         ""
     };
 
-    let duplex_back_scan = if duplex {
-        r#"
-        # Arka yüz tarama
-        try {
-            $imgBack = $item.Transfer()
-            $pageCount++
-            $bmpFileBack = "$tempBase\scan_page_$pageCount.bmp"
-            if (Test-Path $bmpFileBack) { Remove-Item $bmpFileBack -Force }
-            $imgBack.SaveFile($bmpFileBack)
-        } catch {
-            # Arka yüz alınamadıysa tek sayfa ile devam et
-            Write-Output "WARN:Arka yuz alinamadi, tek sayfa ile devam ediliyor"
-        }
-        "#
-    } else {
-        ""
-    };
-
     let ps_script = format!(
         r#"
         $ErrorActionPreference = 'Stop'
@@ -224,7 +206,18 @@ fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool) -> Res
             throw "Fujitsu fi-8150U tarayıcısı bulunamadı!"
         }}
 
-        $scanner = $device.Connect()
+        # Tarayıcı meşgulse yeniden dene (3 deneme)
+        $scanner = $null
+        for ($attempt = 1; $attempt -le 3; $attempt++) {{
+            try {{
+                $scanner = $device.Connect()
+                break
+            }} catch {{
+                if ($attempt -eq 3) {{ throw "Tarayıcı meşgul, 3 deneme başarısız: $_" }}
+                Write-Host "Tarayıcı meşgul, $attempt. deneme başarısız. 2 saniye bekleniyor..."
+                Start-Sleep -Seconds 2
+            }}
+        }}
 
         {duplex_setup}
 
@@ -237,15 +230,38 @@ fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool) -> Res
 
         $pageCount = 0
         $tempBase = "{temp_dir_str}"
+        $hasMorePages = $true
 
-        # Ön yüz tarama
-        $img = $item.Transfer()
-        $pageCount++
-        $bmpFile = "$tempBase\scan_page_$pageCount.bmp"
-        if (Test-Path $bmpFile) {{ Remove-Item $bmpFile -Force }}
-        $img.SaveFile($bmpFile)
+        # Besleyicide kağıt kalmayana kadar tara
+        while ($hasMorePages) {{
+            # Besleyicide kağıt var mı kontrol et (Property 3087, Bit 0 = FEED_READY)
+            if ($pageCount -gt 0) {{
+                try {{
+                    $feedStatus = $scanner.Properties("3087").Value
+                    if (-not ($feedStatus -band 1)) {{
+                        $hasMorePages = $false
+                        continue
+                    }}
+                }} catch {{
+                    $hasMorePages = $false
+                    continue
+                }}
+            }}
 
-        {duplex_back_scan}
+            try {{
+                $img = $item.Transfer()
+                $pageCount++
+                $bmpFile = "$tempBase\scan_page_$pageCount.bmp"
+                if (Test-Path $bmpFile) {{ Remove-Item $bmpFile -Force }}
+                $img.SaveFile($bmpFile)
+            }} catch {{
+                # Besleyici boş veya başka hata - taramayı durdur
+                if ($pageCount -eq 0) {{
+                    throw "Tarama hatası: $_"
+                }}
+                $hasMorePages = $false
+            }}
+        }}
 
         # PNG'ye dönüştür
         Add-Type -AssemblyName System.Drawing
@@ -266,7 +282,6 @@ fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool) -> Res
         Write-Output "PAGES:$pageCount"
     "#,
         duplex_setup = duplex_setup,
-        duplex_back_scan = duplex_back_scan,
         temp_dir_str = temp_dir_str,
         color_mode = color_mode,
         dpi = dpi,
