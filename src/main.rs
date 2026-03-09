@@ -11,6 +11,8 @@ use std::io::Cursor;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Deserialize)]
 struct ScanRequest {
@@ -110,6 +112,7 @@ struct HealthResponse {
 
 /// Beyaz kenarları tespit edip görüntüyü kırpar (auto-crop).
 /// Eşik değeri (threshold) ile beyaza yakın pikseller de beyaz sayılır.
+#[tracing::instrument(skip(img))]
 fn auto_crop(img: &DynamicImage) -> DynamicImage {
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
@@ -171,9 +174,11 @@ fn auto_crop(img: &DynamicImage) -> DynamicImage {
     let crop_w = right - left + 1;
     let crop_h = bottom - top + 1;
 
-    println!(
-        "Auto-crop: {}x{} -> {}x{} (sol:{}, üst:{}, sağ:{}, alt:{})",
-        w, h, crop_w, crop_h, left, top, right, bottom
+    tracing::debug!(
+        from_w = w, from_h = h,
+        to_w = crop_w, to_h = crop_h,
+        left, top, right, bottom,
+        "Auto-crop uygulandı"
     );
 
     img.crop_imm(left, top, crop_w, crop_h)
@@ -182,6 +187,7 @@ fn auto_crop(img: &DynamicImage) -> DynamicImage {
 /// Tek bir fiziksel yaprağı tarar.
 /// Simplex: 1 BMP döndürür. Duplex: 2 BMP döndürür (ön + arka).
 /// Besleyici boşsa boş Vec döndürür.
+#[tracing::instrument(skip(profile, temp_dir))]
 fn scan_single_sheet(
     sheet_num: u32,
     image_start_num: u32,
@@ -335,7 +341,7 @@ fn scan_single_sheet(
         }
         // İlk yaprak değilse hata yerine boş dön
         if sheet_num > 1 {
-            println!("Yaprak {} hatası (tarama durduruluyor): {}", sheet_num, stderr_str.trim());
+            tracing::warn!(sheet = sheet_num, error = stderr_str.trim(), "Yaprak hatası, tarama durduruluyor");
             return Ok(Vec::new());
         }
         anyhow::bail!("Tarama hatası: {}", stderr_str);
@@ -363,6 +369,7 @@ fn scan_single_sheet(
     Ok(results)
 }
 
+#[tracing::instrument(skip(profile))]
 fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool, expected_pages: Option<u32>, quality: u8) -> Result<Vec<(Vec<u8>, u32, u32)>> {
     let temp_dir = std::env::temp_dir();
     // pages = fiziksel yaprak sayısı
@@ -371,16 +378,16 @@ fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool, expect
     let mut image_counter = 1u32;
 
     for sheet in 1..=max_sheets {
-        println!("Yaprak {} taranıyor{}...", sheet, if duplex { " (çift taraflı)" } else { "" });
+        tracing::info!(sheet = sheet, duplex, "Yaprak taranıyor");
 
         match scan_single_sheet(sheet, image_counter, profile, duplex, &temp_dir) {
             Ok(bmp_paths) if bmp_paths.is_empty() => {
-                println!("Yaprak {} yok veya besleyici boş, tarama tamamlandı.", sheet);
+                tracing::info!(sheet = sheet, "Yaprak yok veya besleyici boş, tarama tamamlandı");
                 break;
             }
             Ok(bmp_paths) => {
                 for bmp_path in &bmp_paths {
-                    println!("Görüntü {} başarılı: {}", image_counter, bmp_path.display());
+                    tracing::info!(image = image_counter, path = %bmp_path.display(), "Görüntü tarandı");
 
                     let img = image::open(bmp_path)
                         .context(format!("Görüntü {} açılamadı", image_counter))?;
@@ -409,7 +416,7 @@ fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool, expect
 
                 // Sonraki yaprak için tarayıcının serbest kalmasını bekle
                 if sheet < max_sheets {
-                    println!("Tarayıcı serbest bırakılıyor (2 saniye)...");
+                    tracing::debug!("Tarayıcı serbest bırakılıyor (2 saniye)");
                     std::thread::sleep(Duration::from_secs(2));
                 }
             }
@@ -417,7 +424,7 @@ fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool, expect
                 if all_images.is_empty() {
                     return Err(e);
                 }
-                println!("Yaprak {} hatası: {}, mevcut görüntülerle devam ediliyor.", sheet, e);
+                tracing::warn!(sheet = sheet, error = %e, "Yaprak hatası, mevcut görüntülerle devam ediliyor");
                 break;
             }
         }
@@ -427,7 +434,7 @@ fn scan_document(duplex: bool, profile: &ScanProfile, do_auto_crop: bool, expect
         anyhow::bail!("Hiç sayfa taranamadı!");
     }
 
-    println!("Toplam {} görüntü tarandı ({} yaprak).", all_images.len(), (all_images.len() + 1) / 2);
+    tracing::info!(pages = all_images.len(), sheets = (all_images.len() + 1) / 2, "Tarama tamamlandı");
     Ok(all_images)
 }
 
@@ -438,6 +445,7 @@ async fn health_check() -> Json<HealthResponse> {
     })
 }
 
+#[tracing::instrument(skip(body))]
 async fn scan_endpoint(body: Option<Json<ScanRequest>>) -> (StatusCode, Json<ScanResponse>) {
     let (duplex, profile_key, do_auto_crop, expected_pages, quality) = match body {
         Some(Json(r)) => (r.duplex, r.profile, r.auto_crop, r.pages, r.quality),
@@ -463,13 +471,13 @@ async fn scan_endpoint(body: Option<Json<ScanRequest>>) -> (StatusCode, Json<Sca
         }
     };
 
-    println!(
-        "Tarama isteği alındı (profil: {}, duplex: {}, auto_crop: {}, pages: {}, quality: {})...",
-        profile.name,
-        if duplex { "çift taraflı" } else { "tek taraflı" },
-        do_auto_crop,
-        expected_pages.map_or("otomatik".to_string(), |p| p.to_string()),
-        quality
+    tracing::info!(
+        profile = profile.name,
+        duplex,
+        auto_crop = do_auto_crop,
+        pages = ?expected_pages,
+        quality,
+        "Tarama isteği alındı"
     );
 
     let dpi = profile.dpi;
@@ -492,7 +500,7 @@ async fn scan_endpoint(body: Option<Json<ScanRequest>>) -> (StatusCode, Json<Sca
                 })
                 .collect();
 
-            println!("Tarama başarılı: {} sayfa", page_count);
+            tracing::info!(pages = page_count, "Tarama başarılı");
 
             (
                 StatusCode::OK,
@@ -509,7 +517,7 @@ async fn scan_endpoint(body: Option<Json<ScanRequest>>) -> (StatusCode, Json<Sca
             )
         }
         Err(e) => {
-            eprintln!("Tarama hatası: {}", e);
+            tracing::error!(error = %e, "Tarama hatası");
 
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -530,9 +538,16 @@ async fn scan_endpoint(body: Option<Json<ScanRequest>>) -> (StatusCode, Json<Sca
 
 #[tokio::main]
 async fn main() {
-    println!("=================================");
-    println!("  Fujitsu fi-8150U Tarama API");
-    println!("=================================");
+    // Tracing subscriber başlat (varsayılan: info seviyesi, RUST_LOG ile değiştirilebilir)
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    tracing::info!("=================================");
+    tracing::info!("  Fujitsu fi-8150U Tarama API");
+    tracing::info!("=================================");
 
     // CORS ayarları - React'tan erişim için
     let cors = CorsLayer::new()
@@ -544,17 +559,16 @@ async fn main() {
         .route("/", get(health_check))
         .route("/health", get(health_check))
         .route("/scan", post(scan_endpoint))
-        .layer(cors);
+        .layer(cors)
+        .layer(TraceLayer::new_for_http());
 
     let addr = "0.0.0.0:3000";
-    println!("\nAPI sunucusu başlatılıyor: http://{}", addr);
-    println!("\nEndpoint'ler:");
-    println!("  GET  /        - Sağlık kontrolü");
-    println!("  GET  /health  - Sağlık kontrolü");
-    println!("  POST /scan    - Tarama başlat");
-    println!("                  Body: {{\"duplex\": bool, \"profile\": string, \"auto_crop\": bool, \"pages\": number, \"quality\": 1-100}}");
-    println!("\nProfiller: hizli, standart, renkli (varsayılan), yuksek, siyah-beyaz");
-    println!();
+    tracing::info!(addr, "API sunucusu başlatılıyor");
+    tracing::info!("Endpoint'ler:");
+    tracing::info!("  GET  /        - Sağlık kontrolü");
+    tracing::info!("  GET  /health  - Sağlık kontrolü");
+    tracing::info!("  POST /scan    - Tarama başlat");
+    tracing::info!("Profiller: hizli, standart, renkli (varsayılan), yuksek, siyah-beyaz");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
